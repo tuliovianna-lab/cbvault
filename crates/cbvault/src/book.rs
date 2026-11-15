@@ -19,6 +19,7 @@
 //! Original cbvault code, clean-room. It consumes `cbvault-format` for bytes and
 //! `cbvault-chess` for chess.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use cbvault_chess::ctg::{self as chess_ctg, MoveError, Stored};
@@ -149,15 +150,136 @@ impl Book {
         self.index.capacity() * std::mem::size_of::<u64>()
     }
 
+    /// The `.ctg` file itself, for callers that read it page by page.
+    pub fn ctg(&self) -> &Ctg {
+        &self.ctg
+    }
+
     /// Looks `board` up. `Ok(None)` when the book does not have the position.
     pub fn probe(&self, board: &Board) -> Result<Option<BookPosition>> {
-        let stored = chess_ctg::stored_form(board);
-        for (key, len) in chess_ctg::keys(&stored) {
-            if let Some(found) = self.find(&key[..len], |entry| book_position(board, &stored, entry))? {
+        self.probe_stored(board, &chess_ctg::stored_form(board))
+    }
+
+    fn probe_stored(&self, board: &Board, stored: &Stored) -> Result<Option<BookPosition>> {
+        for (key, len) in chess_ctg::keys(stored) {
+            if let Some(found) = self.find(&key[..len], |entry| book_position(board, stored, entry))? {
                 return Ok(Some(found));
             }
         }
         Ok(None)
+    }
+
+    /// The statistics of `board`'s entry, without decoding its moves.
+    fn stats_of(&self, board: &Board) -> Result<Option<Stats>> {
+        let stored = chess_ctg::stored_form(board);
+        for (key, len) in chess_ctg::keys(&stored) {
+            if let Some(stats) = self.find(&key[..len], |e| e.stats())? {
+                return Ok(Some(stats));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Walks the book from the initial position, breadth first, and hands every
+    /// real position it reaches to `emit`, once, level by level (`ply` is the
+    /// shortest distance from the initial position).
+    ///
+    /// A book stores positions with White to move, so an entry alone does not
+    /// say which real position it stands for. The walk gives every position its
+    /// real side to move, and every move its real squares. Entries the walk
+    /// never reaches are counted in [`WalkReport::reached`]'s complement.
+    ///
+    /// Positions are told apart by their PolyGlot Zobrist key. Two different
+    /// positions with the same key would be merged, so a second, independent
+    /// check of the board is kept for every key, and a mismatch is counted in
+    /// [`WalkReport::collisions`] rather than passed over.
+    pub fn walk(&self, mut emit: impl FnMut(&WalkedPosition) -> Result<()>) -> Result<WalkReport> {
+        let mut report = WalkReport::default();
+        let start = Board::startpos();
+        let mut seen: HashMap<u64, u32> = HashMap::new();
+        seen.insert(start.zobrist(), board_check(&start));
+        if self.stats_of(&start)?.is_none() {
+            return Ok(report);
+        }
+        let mut frontier = vec![start];
+        let mut ply = 0u32;
+        while !frontier.is_empty() {
+            let mut next = Vec::new();
+            for chunk in frontier.chunks(WALK_CHUNK) {
+                let walked: Vec<Result<Option<WalkedPosition>>> =
+                    chunk.par_iter().map(|board| self.walk_one(board, ply)).collect();
+                for item in walked {
+                    let Some(pos) = item? else { continue };
+                    emit(&pos)?;
+                    report.positions += 1;
+                    report.reached.push(pos.found.offset);
+                    for (m, kid) in pos.found.moves.iter().zip(&pos.moves) {
+                        let Ok(mv) = m.mv else {
+                            report.moves_undecoded += 1;
+                            continue;
+                        };
+                        report.moves_decoded += 1;
+                        if kid.child.is_none() {
+                            report.children_missing += 1;
+                            continue;
+                        }
+                        let mut child = pos.board;
+                        if child.play(mv).is_err() {
+                            continue;
+                        }
+                        let check = board_check(&child);
+                        match seen.entry(child.zobrist()) {
+                            std::collections::hash_map::Entry::Occupied(o) => {
+                                if *o.get() != check {
+                                    report.collisions += 1;
+                                }
+                            }
+                            std::collections::hash_map::Entry::Vacant(v) => {
+                                v.insert(check);
+                                next.push(child);
+                            }
+                        }
+                    }
+                }
+            }
+            frontier = next;
+            ply += 1;
+        }
+        report.plies = ply;
+        report.reached.par_sort_unstable();
+        report.reached.dedup();
+        Ok(report)
+    }
+
+    fn walk_one(&self, board: &Board, ply: u32) -> Result<Option<WalkedPosition>> {
+        let stored = chess_ctg::stored_form(board);
+        let Some(found) = self.probe_stored(board, &stored)? else {
+            return Ok(None);
+        };
+        let mut moves = Vec::with_capacity(found.moves.len());
+        for m in &found.moves {
+            let walked = match m.mv {
+                Ok(mv) => {
+                    let mut child = *board;
+                    if child.play(mv).is_ok() {
+                        WalkedMove { child_key: Some(child.zobrist()), child: self.stats_of(&child)? }
+                    } else {
+                        WalkedMove { child_key: None, child: None }
+                    }
+                }
+                Err(_) => WalkedMove { child_key: None, child: None },
+            };
+            moves.push(walked);
+        }
+        Ok(Some(WalkedPosition {
+            board: *board,
+            key: board.zobrist(),
+            ply,
+            flipped: stored.flipped,
+            mirrored: stored.mirrored,
+            found,
+            moves,
+        }))
     }
 
     /// Looks up the position after `mv` in `board`. `Ok(None)` when the move is
@@ -344,6 +466,80 @@ fn book_position(board: &Board, stored: &Stored, entry: &Entry<'_>) -> BookPosit
     let stats = entry.stats();
     let evaluation = stats.evaluation().map(|e| e.for_real_position(stored.flipped));
     BookPosition { stats, moves, evaluation, offset: entry.offset }
+}
+
+/// Positions probed in parallel at a time during [`Book::walk`], which bounds
+/// the memory a wide level takes.
+const WALK_CHUNK: usize = 1 << 18;
+
+/// A second hash of a board, independent of the Zobrist key: the pieces, the
+/// side to move and the castling rights (FNV-1a). The en-passant square is left
+/// out on purpose: the Zobrist key counts it only when a capture is possible.
+fn board_check(board: &Board) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    let mut mix = |b: u8| {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    };
+    for i in 0..64u8 {
+        mix(board
+            .piece_at(gigachess::Square::new(i))
+            .map_or(0, |p| 1 + p.color.index() as u8 * 6 + p.role.index() as u8));
+    }
+    mix(board.turn().index() as u8);
+    mix(board.castling_rights());
+    h
+}
+
+/// A real position reached by [`Book::walk`].
+#[derive(Clone, Debug)]
+pub struct WalkedPosition {
+    /// The position, with its real side to move.
+    pub board: Board,
+    /// Its PolyGlot Zobrist key (`Board::zobrist`).
+    pub key: u64,
+    /// Its shortest distance from the initial position, in plies.
+    pub ply: u32,
+    /// Whether its entry is stored colour-flipped (Black is to move).
+    pub flipped: bool,
+    /// Whether its entry is stored mirrored left to right.
+    pub mirrored: bool,
+    /// The book's entry for it, with its moves in stored order.
+    pub found: BookPosition,
+    /// For each of `found.moves`, in the same order: where the move leads.
+    pub moves: Vec<WalkedMove>,
+}
+
+/// Where a book move leads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalkedMove {
+    /// The PolyGlot Zobrist key of the position after the move (`None` when
+    /// the move byte did not decode).
+    pub child_key: Option<u64>,
+    /// The statistics of that position, when the book has it. They are the
+    /// move's statistics, from the point of view of the side to move there.
+    pub child: Option<Stats>,
+}
+
+/// What [`Book::walk`] counted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WalkReport {
+    /// Real positions reached and emitted.
+    pub positions: u64,
+    /// Levels walked: the deepest position is `plies - 1` plies deep.
+    pub plies: u32,
+    /// Book moves decoded to a legal move.
+    pub moves_decoded: u64,
+    /// Book moves that did not decode (unknown or illegal byte).
+    pub moves_undecoded: u64,
+    /// Decoded moves whose resulting position is not in the book.
+    pub children_missing: u64,
+    /// Keys reached by two boards the second check tells apart.
+    pub collisions: u64,
+    /// The `.ctg` offsets of the entries reached, sorted, without repeats.
+    /// Every other entry is an orphan: no move sequence from the initial
+    /// position reaches it.
+    pub reached: Vec<u64>,
 }
 
 /// What [`Book::verify`] counted.

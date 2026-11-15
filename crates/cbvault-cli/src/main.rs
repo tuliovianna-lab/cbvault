@@ -4,6 +4,8 @@
 //! `info`, `verify`, `pgn`, `games`, `archive` and `book`, with stable `--json` output.
 
 mod book;
+mod book_export;
+mod book_serve;
 
 use std::io::Write;
 use std::path::Path;
@@ -38,6 +40,9 @@ const USAGE: &str = "usage:
   cbvault book info   <book> [--json]
   cbvault book probe  <book> [--fen FEN] [--moves M...] [--json]
   cbvault book verify <book> [--children] [--json]
+  cbvault book export <book> [--sqlite OUT] [--polyglot OUT] [--weight games|score|marks] [--with-fen] [--with-page-tails]
+  cbvault book verify-export <sqlite> <book> [--json]
+  cbvault book serve  <book> [<book>...]
 
 The PGN goes to `out`, or to stdout when no path is given, so it can be piped.
 The export report always goes to stderr, so stdout stays pure PGN.
@@ -45,6 +50,10 @@ The export report always goes to stderr, so stdout stays pure PGN.
 <book> is a ChessBase opening book: the .ctg file or its base name. Opening one
 scans the .ctg once to build an index in memory (about 8 bytes per position).
 --moves takes SAN (e4 Nf3) or UCI (e2e4) moves played from the start or from --fen.
+book export walks the book from the start: --sqlite keeps every byte of the .ctg
+(needs a build with --features sqlite), --polyglot writes a PolyGlot .bin.
+book serve keeps books open and answers one probe per line on stdin/stdout
+(request: id TAB book TAB fen|moves TAB value; reply: the probe --json line).
 
 <db> is a ChessBase database base path (e.g. 'Mega Database 2025/Mega Database 2025' or 'Mega.cbh').
 --threads sets the number of worker threads. The default is 4: past two workers the

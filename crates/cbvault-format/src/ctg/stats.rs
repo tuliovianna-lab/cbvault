@@ -77,6 +77,24 @@ impl Stats {
         }
     }
 
+    /// The block as stored: the inverse of [`Stats::parse`]. Fields that hold
+    /// 24 bits on disk keep their low 24 bits.
+    pub fn to_bytes(&self) -> [u8; STATS_LEN] {
+        let mut b = [0u8; STATS_LEN];
+        let mut put24 = |at: usize, v: u32| b[at..at + 3].copy_from_slice(&v.to_be_bytes()[1..]);
+        put24(0, self.games);
+        put24(3, self.wins);
+        put24(6, self.losses);
+        put24(9, self.draws);
+        put24(16, self.rated_games);
+        put24(23, self.opponent_rated_games);
+        b[12..16].copy_from_slice(&self.raw_score.to_be_bytes());
+        b[19..23].copy_from_slice(&self.rating_sum.to_be_bytes());
+        b[26..30].copy_from_slice(&self.opponent_rating_sum.to_be_bytes());
+        b[30..33].copy_from_slice(&self.raw_tail);
+        b
+    }
+
     /// The stored evaluation, if one was set. Use
     /// [`super::Evaluation::for_real_position`] to orient it.
     pub fn evaluation(&self) -> Option<super::Evaluation> {
@@ -148,6 +166,14 @@ mod tests {
         assert_eq!((s.opponent_rated_games, s.opponent_average_rating()), (50, Some(2_400)));
         assert!(s.main_move() && !s.dont_play());
         assert_eq!(s.evaluation(), Some(super::super::Evaluation(14)));
+    }
+
+    #[test]
+    fn to_bytes_is_the_inverse_of_parse() {
+        // Every byte distinct, so a field written to the wrong offset shows up.
+        let b: [u8; STATS_LEN] = std::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11));
+        assert_eq!(Stats::parse(&b).to_bytes(), b);
+        assert_eq!(Stats::default().to_bytes(), [0u8; STATS_LEN]);
     }
 
     #[test]

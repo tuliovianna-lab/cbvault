@@ -49,6 +49,18 @@ Data pages (page 1 onwards):
 | 2 | u16 | bytes used in the page, header included | Walking the entries ends exactly at this value on **3000/3000** pages probed |
 | 4 | … | entries, back to back | |
 
+**Bytes after the bytes-used mark** (probed for the export change,
+`ctg-book-export`):
+- They are not zero on most pages: 441,876 of 526,837 data pages in the Fritz
+  Power Book 2025, and 384,331 of 561,556 in HIARCS 15. In the small test
+  book, written by ChessBase in one session, they are all zero.
+- In the first 2,000 pages of HIARCS 15, 27,286 whole entries could be parsed
+  from those bytes. For 27,054 of them (99.1%) the same key is a live entry on
+  some page.
+- They look like stale copies, left behind when entries move to another page.
+  They are not entries of the book: the entry count and the bytes-used field
+  exclude them. The export keeps them only with `--with-page-tails`.
+
 ## Position entry
 
 | Part | Size | Meaning |

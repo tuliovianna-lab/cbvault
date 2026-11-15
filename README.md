@@ -62,6 +62,8 @@ cbvault pgn "MyDatabase.2cbh" games.pgn --threads 8
 cbvault archive list "Collection.cbv"
 cbvault archive extract "Collection.cbv" ./extracted --threads 8
 cbvault book probe "MyBook.ctg" --moves e4 c5 Nf3
+cbvault book export "MyBook.ctg" --sqlite MyBook.sqlite --polyglot MyBook.bin   # build with --features sqlite
+cbvault book serve "MyBook.ctg" "Other.ctg"   # one probe per line on stdin/stdout, for other programs
 ```
 
 The same commands also work with classic `.cbh` databases; archive commands accept `.cbz` with `--password`. The CLI can emit machine-readable JSON and redirect PGN to stdout.
@@ -76,7 +78,7 @@ The same commands also work with classic `.cbh` databases; archive commands acce
 
 **Portable PGN export.** Export entire sets or game ranges from **both `.cbh` and `.2cbh`**, including supported annotations and variations. Sequential and parallel paths are regression-tested for deterministic output.
 
-**Opening books.** Open a ChessBase opening book (`.ctg`) and look up any position: its book moves, and games, results and average rating for the position and for each move. Positions are found through an index cbvault builds in memory when the book is opened (about 8 bytes per position), not through the book's own `.cto` table, whose hash is not established.
+**Opening books.** Open a ChessBase opening book (`.ctg`) and look up any position: its book moves, and games, results and average rating for the position and for each move. Positions are found through an index cbvault builds in memory when the book is opened (about 8 bytes per position), not through the book's own `.cto` table, whose hash is not established. A book can also be **exported without losing a byte** to SQLite, with positions under their PolyGlot keys so any program can query it, or to a PolyGlot `.bin` ([docs/book-export.md](docs/book-export.md)).
 
 **Archive migration and recovery. List or extract `.cbv`/`.cbz` members without implementing a ChessBase archive reader yourself. On the tested reference archive, cbvault reproduced **all 3,871 members (3.61 GB extracted) byte-for-byte** against the reference extraction.
 

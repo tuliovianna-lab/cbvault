@@ -95,6 +95,11 @@ impl Ctg {
         self.file.read_into(u64::from(number) * PAGE_SIZE as u64, buf)
     }
 
+    /// Reads the header page (page 0) into `buf`. It is not decoded.
+    pub fn read_header(&self, buf: &mut [u8; PAGE_SIZE]) -> Result<()> {
+        self.file.read_into(0, buf)
+    }
+
     /// Borrows data page `number` straight from the mapping, when the file is
     /// memory-mapped.
     pub fn mapped_page(&self, number: u32) -> Option<&[u8]> {
@@ -138,6 +143,14 @@ impl<'a> Entry<'a> {
     pub fn move_pairs(&self) -> impl Iterator<Item = (u8, u8)> + 'a {
         self.moves.as_chunks::<2>().0.iter().map(|&[byte, annotation]| (byte, annotation))
     }
+}
+
+/// The bytes-used field of a data page: where its live entries end. The bytes
+/// after it are not entries of the book (in the probed books they mostly hold
+/// stale copies of entries that live on other pages).
+pub fn page_used(page: &[u8]) -> Option<usize> {
+    let used = usize::from(u16::from_be_bytes([*page.get(2)?, *page.get(3)?]));
+    (PAGE_HEADER..=page.len()).contains(&used).then_some(used)
 }
 
 /// The entries of one page.

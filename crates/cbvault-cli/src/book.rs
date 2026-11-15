@@ -4,6 +4,8 @@
 //! - `book probe <book> [--fen FEN] [--moves M…] [--json]`: the book moves of a
 //!   position, each with the statistics of the position it leads to.
 //! - `book verify <book> [--children] [--json]`: checks every entry.
+//! - `book export` and `book verify-export`: see [`crate::book_export`].
+//! - `book serve`: see [`crate::book_serve`].
 
 use std::time::Instant;
 
@@ -20,6 +22,9 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>) -> CliResult {
         Some("info") => run_info(args),
         Some("probe") => run_probe(args),
         Some("verify") => run_verify(args),
+        Some("export") => crate::book_export::run_export(args),
+        Some("verify-export") => crate::book_export::run_verify_export(args),
+        Some("serve") => crate::book_serve::run_serve(args),
         _ => Err(USAGE.into()),
     }
 }
@@ -66,7 +71,7 @@ fn run_info(args: impl Iterator<Item = String>) -> CliResult {
 }
 
 /// Plays `moves` (SAN or UCI, gigachess spelling) from `board`.
-fn play_moves(board: &mut Board, moves: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn play_moves(board: &mut Board, moves: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     for (i, m) in moves.iter().enumerate() {
         let mv = gigachess::san::san_to_move(board, m)
             .or_else(|| board.legal_moves().into_iter().find(|mv| mv.to_string() == *m))
@@ -145,13 +150,23 @@ fn run_probe(mut args: impl Iterator<Item = String>) -> CliResult {
     };
     play_moves(&mut board, &moves)?;
     let (book, secs) = open(&path)?;
-    let Some(found) = book.probe(&board)? else {
-        if json {
-            println!("{{\"fen\":{},\"found\":false}}", json_str(&board.to_fen()));
-        } else {
-            println!("{}\nnot in the book", board.to_fen());
-        }
+    if json {
+        let (text, found) = probe_json(&book, &board)?;
+        println!("{text}");
+        return Ok(found);
+    }
+    let Some((found, rows)) = probe_rows(&book, &board)? else {
+        println!("{}\nnot in the book", board.to_fen());
         return Ok(false);
+    };
+    print_probe_text(&board, &found, &rows, secs);
+    Ok(true)
+}
+
+/// The book's entry for `board` and its moves as rows, most played first.
+fn probe_rows(book: &Book, board: &Board) -> Result<Option<(BookPosition, Vec<Row>)>, cbvault::book::Error> {
+    let Some(found) = book.probe(board)? else {
+        return Ok(None);
     };
     let mut rows: Vec<Row> = Vec::with_capacity(found.moves.len());
     for m in &found.moves {
@@ -159,10 +174,10 @@ fn run_probe(mut args: impl Iterator<Item = String>) -> CliResult {
             Ok(mv) => rows.push(Row {
                 byte: m.byte,
                 annotation: m.annotation,
-                san: gigachess::san::move_to_san(&board, mv).map_or_else(|| mv.to_string(), |s| s.to_string()),
+                san: gigachess::san::move_to_san(board, mv).map_or_else(|| mv.to_string(), |s| s.to_string()),
                 uci: mv.to_string(),
                 error: None,
-                child: book.probe_after(&board, mv)?,
+                child: book.probe_after(board, mv)?,
             }),
             Err(e) => rows.push(Row {
                 byte: m.byte,
@@ -175,12 +190,16 @@ fn run_probe(mut args: impl Iterator<Item = String>) -> CliResult {
         }
     }
     rows.sort_by_key(|r| std::cmp::Reverse(r.results()));
-    if json {
-        print_probe_json(&board, &found, &rows);
-    } else {
-        print_probe_text(&board, &found, &rows, secs);
-    }
-    Ok(true)
+    Ok(Some((found, rows)))
+}
+
+/// `book probe --json` for `board`, and whether the book has the position.
+/// `book serve` answers with the same JSON.
+pub(crate) fn probe_json(book: &Book, board: &Board) -> Result<(String, bool), cbvault::book::Error> {
+    Ok(match probe_rows(book, board)? {
+        Some((found, rows)) => (probe_json_text(board, &found, &rows), true),
+        None => (format!("{{\"fen\":{},\"found\":false}}", json_str(&board.to_fen())), false),
+    })
 }
 
 fn print_probe_text(board: &Board, found: &BookPosition, rows: &[Row], secs: f64) {
@@ -232,7 +251,7 @@ fn print_probe_text(board: &Board, found: &BookPosition, rows: &[Row], secs: f64
     }
 }
 
-fn print_probe_json(board: &Board, found: &BookPosition, rows: &[Row]) {
+fn probe_json_text(board: &Board, found: &BookPosition, rows: &[Row]) -> String {
     let s = found.stats;
     let items: Vec<String> = rows
         .iter()
@@ -255,24 +274,40 @@ fn print_probe_json(board: &Board, found: &BookPosition, rows: &[Row]) {
                         c.stats.opponent_rating_sum
                     )
                 });
+                let evaluation = r.child.as_ref().and_then(|c| c.evaluation);
+                let marks = r.child.as_ref().map(|c| (c.stats.main_move(), c.stats.dont_play()));
+                let num = |v: Option<f64>| v.map_or("null".into(), |v| format!("{v:.2}"));
                 format!(
-                    "{{\"byte\":{},\"annotation\":{},\"symbol\":{},\"colour\":{},\"evaluation\":{},\"san\":{},\"uci\":{},\"after\":{child}}}",
+                    concat!(
+                        "{{\"byte\":{},\"annotation\":{},\"symbol\":{},\"colour\":{},\"evaluation\":{},",
+                        "\"evaluation_symbol\":{},\"main_move\":{},\"dont_play\":{},\"san\":{},\"uci\":{},",
+                        "\"n\":{},\"score\":{},\"draw_pct\":{},\"av\":{},\"after\":{}}}"
+                    ),
                     r.byte,
                     r.annotation,
                     cbvault_format::ctg::Annotation(r.annotation).symbol().map_or("null".into(), json_str),
                     r.colour().map_or("null".into(), json_str),
-                    r.child.as_ref().and_then(|c| c.evaluation).map_or("null".into(), |e| e.0.to_string()),
+                    evaluation.map_or("null".into(), |e| e.0.to_string()),
+                    evaluation.and_then(|e| e.symbol()).map_or("null".into(), json_str),
+                    marks.map_or("null".into(), |m| m.0.to_string()),
+                    marks.map_or("null".into(), |m| m.1.to_string()),
                     json_str(&r.san),
-                    json_str(&r.uci)
+                    json_str(&r.uci),
+                    r.child.as_ref().map_or("null".into(), |_| r.results().to_string()),
+                    num(r.score()),
+                    num(r.draw_rate()),
+                    r.mover_rating().map_or("null".into(), |v| v.to_string()),
+                    child
                 )
             }
         })
         .collect();
-    println!(
+    format!(
         concat!(
             "{{\"fen\":{},\"found\":true,\"games\":{},\"wins\":{},\"draws\":{},\"losses\":{},",
             "\"rated_games\":{},\"rating_sum\":{},\"opponent_rated_games\":{},\"opponent_rating_sum\":{},",
-            "\"raw_score\":{},\"raw_tail\":[{},{},{}],\"moves\":[{}]}}"
+            "\"raw_score\":{},\"raw_tail\":[{},{},{}],\"n\":{},\"av\":{},\"opponent_av\":{},",
+            "\"evaluation\":{},\"evaluation_symbol\":{},\"moves\":[{}]}}"
         ),
         json_str(&board.to_fen()),
         s.games,
@@ -287,8 +322,13 @@ fn print_probe_json(board: &Board, found: &BookPosition, rows: &[Row]) {
         s.raw_tail[0],
         s.raw_tail[1],
         s.raw_tail[2],
+        s.results(),
+        s.average_rating().map_or("null".into(), |v| v.to_string()),
+        s.opponent_average_rating().map_or("null".into(), |v| v.to_string()),
+        found.evaluation.map_or("null".into(), |e| e.0.to_string()),
+        found.evaluation.and_then(|e| e.symbol()).map_or("null".into(), json_str),
         items.join(",")
-    );
+    )
 }
 
 fn run_verify(args: impl Iterator<Item = String>) -> CliResult {

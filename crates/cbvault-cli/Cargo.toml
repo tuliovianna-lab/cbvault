@@ -25,6 +25,13 @@ cbvault-format.workspace = true
 cbvault.workspace = true
 cbvault-chess.workspace = true
 gigachess.workspace = true
+# Only for `book export --sqlite` / `book verify-export`, behind the `sqlite`
+# feature: SQLite is compiled in (`bundled`), so no system library is needed.
+rusqlite = { version = "0.42", features = ["bundled"], optional = true }
+sha2 = { version = "0.11", optional = true }
+
+[features]
+sqlite = ["dep:rusqlite", "dep:sha2"]
 
 [[example]]
 name = "dump_null_games"
